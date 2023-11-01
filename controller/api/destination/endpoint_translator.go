@@ -487,30 +487,26 @@ func createWeightedAddr(
 
 	weightedAddr.MetricLabels = pkgK8s.GetPodLabels(address.OwnerKind, address.OwnerName, address.Pod)
 
-	// It the port is annotated as skipped, it is unmeshed.
+	// If the traffic is unmeshed, then there is no additional metadata to add.
 	skipped := getPodSkippedInboundPortsAnnotations(address.Pod)
-	if _, ok := skipped[address.Port]; ok {
+	if _, ok := skipped[address.Port]; ok || address.Pod.Labels[pkgK8s.ControllerNSLabel] != controllerNS {
 		return &weightedAddr, nil
 	}
 
-	// If the pod is not a part of this mesh, return the weighted address
-	// without any additional configuration.
+	// Configure meshed transport (mTLS and protocol upgrades).
 	//
-	// TODO this should be relaxed to match a trust domain annotation so that
-	// multiple meshes can participate in identity if they share trust roots.
-	if address.Pod.Labels[pkgK8s.ControllerNSLabel] == controllerNS {
-		_, opaq := opaquePorts[address.Port]
-		err = setMeshedTransport(
-			&weightedAddr,
-			address.Pod,
-			address.OpaqueProtocol || opaq,
-			enableH2Upgrade,
-			controllerNS, identityTrustDomain,
-		)
-		return &weightedAddr, err
-	}
-
-	return &weightedAddr, nil
+	// TODO this should ultimately be relaxed to match a trust domain annotation
+	// so that multiple meshes can participate in identity if they share trust
+	// roots.
+	_, opaq := opaquePorts[address.Port]
+	err = setMeshedTransport(
+		&weightedAddr,
+		address.Pod,
+		address.OpaqueProtocol || opaq,
+		enableH2Upgrade,
+		controllerNS, identityTrustDomain,
+	)
+	return &weightedAddr, err
 }
 
 func setMeshedTransport(
