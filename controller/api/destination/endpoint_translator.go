@@ -487,30 +487,49 @@ func createWeightedAddr(
 
 	weightedAddr.MetricLabels = pkgK8s.GetPodLabels(address.OwnerKind, address.OwnerName, address.Pod)
 
-	// If the pod is not a part of this mesh, return the weighted address
-	// without any additional configuration.
-	if address.Pod.Labels[pkgK8s.ControllerNSLabel] != controllerNS {
-		return &weightedAddr, nil
-	}
-
 	// It the port is annotated as skipped, it is unmeshed.
 	skipped := getPodSkippedInboundPortsAnnotations(address.Pod)
 	if _, ok := skipped[address.Port]; ok {
 		return &weightedAddr, nil
 	}
 
-	// The endpoint is meshed, so configure protocol hinting and identity.
+	// If the pod is not a part of this mesh, return the weighted address
+	// without any additional configuration.
+	//
+	// TODO this should be relaxed to match a trust domain annotation so that
+	// multiple meshes can participate in identity if they share trust roots.
+	if address.Pod.Labels[pkgK8s.ControllerNSLabel] == controllerNS {
+		_, opaq := opaquePorts[address.Port]
+		err = setMeshedTransport(
+			&weightedAddr,
+			address.Pod,
+			address.OpaqueProtocol || opaq,
+			enableH2Upgrade,
+			controllerNS, identityTrustDomain,
+		)
+		return &weightedAddr, err
+	}
 
+	return &weightedAddr, nil
+}
+
+func setMeshedTransport(
+	addr *pb.WeightedAddr,
+	pod *corev1.Pod,
+	opaque, enableH2Upgrade bool,
+	controllerNS, identityTrustDomain string,
+) error {
 	// Set a meshed protocol hint for proxy-to-proxy protocol upgrading.
-	if _, opaq := opaquePorts[address.Port]; address.OpaqueProtocol || opaq {
+	if opaque {
 		// If address is set as opaque by a Server, or its port is set as
 		// opaque by annotation or default value, then set the hinted
 		// protocol to Opaque.
-		port, err := getInboundPort(&address.Pod.Spec)
+		port, err := getInboundPort(&pod.Spec)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read inbound port: %w", err)
+			return fmt.Errorf("failed to read inbound port: %w", err)
 		}
-		weightedAddr.ProtocolHint = &pb.ProtocolHint{
+
+		addr.ProtocolHint = &pb.ProtocolHint{
 			Protocol: &pb.ProtocolHint_Opaque_{
 				Opaque: &pb.ProtocolHint_Opaque{},
 			},
@@ -522,7 +541,7 @@ func createWeightedAddr(
 		// If the pod is controlled by any Linkerd control plane, then it can be
 		// hinted that this destination knows H2 (and handles our orig-proto
 		// translation)
-		weightedAddr.ProtocolHint = &pb.ProtocolHint{
+		addr.ProtocolHint = &pb.ProtocolHint{
 			Protocol: &pb.ProtocolHint_H2_{
 				H2: &pb.ProtocolHint_H2{},
 			},
@@ -531,13 +550,10 @@ func createWeightedAddr(
 
 	// If the pod is controlled by the same Linkerd control plane, then it can
 	// participate in identity with peers.
-	//
-	// TODO this should be relaxed to match a trust domain annotation so that
-	// multiple meshes can participate in identity if they share trust roots.
 	if identityTrustDomain != "" {
-		sa, ns := pkgK8s.GetServiceAccountAndNS(address.Pod)
-		id := fmt.Sprintf("%s.%s.serviceaccount.identity.%s.%s", sa, ns, controllerNSLabel, identityTrustDomain)
-		weightedAddr.TlsIdentity = &pb.TlsIdentity{
+		sa, ns := pkgK8s.GetServiceAccountAndNS(pod)
+		id := fmt.Sprintf("%s.%s.serviceaccount.identity.%s.%s", sa, ns, controllerNS, identityTrustDomain)
+		addr.TlsIdentity = &pb.TlsIdentity{
 			Strategy: &pb.TlsIdentity_DnsLikeIdentity_{
 				DnsLikeIdentity: &pb.TlsIdentity_DnsLikeIdentity{
 					Name: id,
@@ -546,7 +562,7 @@ func createWeightedAddr(
 		}
 	}
 
-	return &weightedAddr, nil
+	return nil
 }
 
 func getNodeTopologyZone(k8sAPI *k8s.MetadataAPI, srcNode string) (string, error) {
