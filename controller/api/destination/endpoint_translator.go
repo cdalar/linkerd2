@@ -462,8 +462,12 @@ func toAddr(address watcher.Address) (*net.TcpAddress, error) {
 	}, nil
 }
 
-func createWeightedAddr(address watcher.Address, opaquePorts map[uint32]struct{}, enableH2Upgrade bool, identityTrustDomain string, controllerNS string) (*pb.WeightedAddr, error) {
-
+func createWeightedAddr(
+	address watcher.Address,
+	opaquePorts map[uint32]struct{},
+	enableH2Upgrade bool,
+	identityTrustDomain, controllerNS string,
+) (*pb.WeightedAddr, error) {
 	tcpAddr, err := toAddr(address)
 	if err != nil {
 		return nil, err
@@ -481,38 +485,47 @@ func createWeightedAddr(address watcher.Address, opaquePorts map[uint32]struct{}
 		return &weightedAddr, nil
 	}
 
-	skippedInboundPorts := getPodSkippedInboundPortsAnnotations(address.Pod)
-
-	controllerNSLabel := address.Pod.Labels[pkgK8s.ControllerNSLabel]
-	sa, ns := pkgK8s.GetServiceAccountAndNS(address.Pod)
 	weightedAddr.MetricLabels = pkgK8s.GetPodLabels(address.OwnerKind, address.OwnerName, address.Pod)
-	_, isSkippedInboundPort := skippedInboundPorts[address.Port]
 
-	weightedAddr.ProtocolHint = &pb.ProtocolHint{}
+	// If the pod is not a part of this mesh, return the weighted address
+	// without any additional configuration.
+	if address.Pod.Labels[pkgK8s.ControllerNSLabel] != controllerNS {
+		return &weightedAddr, nil
+	}
 
-	_, opaquePort := opaquePorts[address.Port]
-	if address.OpaqueProtocol || opaquePort {
+	// It the port is annotated as skipped, it is unmeshed.
+	skipped := getPodSkippedInboundPortsAnnotations(address.Pod)
+	if _, ok := skipped[address.Port]; ok {
+		return &weightedAddr, nil
+	}
+
+	// The endpoint is meshed, so configure protocol hinting and identity.
+
+	// Set a meshed protocol hint for proxy-to-proxy protocol upgrading.
+	if _, opaq := opaquePorts[address.Port]; address.OpaqueProtocol || opaq {
 		// If address is set as opaque by a Server, or its port is set as
-		// opaque by annotation or default value, then set the hinted protocol to
-		// Opaque.
-		weightedAddr.ProtocolHint.Protocol = &pb.ProtocolHint_Opaque_{
-			Opaque: &pb.ProtocolHint_Opaque{},
+		// opaque by annotation or default value, then set the hinted
+		// protocol to Opaque.
+		port, err := getInboundPort(&address.Pod.Spec)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read inbound port: %w", err)
 		}
-		if controllerNSLabel != "" && !isSkippedInboundPort {
-			port, err := getInboundPort(&address.Pod.Spec)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read inbound port: %w", err)
-			}
-			weightedAddr.ProtocolHint.OpaqueTransport = &pb.ProtocolHint_OpaqueTransport{
+		weightedAddr.ProtocolHint = &pb.ProtocolHint{
+			Protocol: &pb.ProtocolHint_Opaque_{
+				Opaque: &pb.ProtocolHint_Opaque{},
+			},
+			OpaqueTransport: &pb.ProtocolHint_OpaqueTransport{
 				InboundPort: port,
-			}
+			},
 		}
-	} else if enableH2Upgrade && controllerNSLabel != "" && !isSkippedInboundPort {
+	} else if enableH2Upgrade {
 		// If the pod is controlled by any Linkerd control plane, then it can be
 		// hinted that this destination knows H2 (and handles our orig-proto
 		// translation)
-		weightedAddr.ProtocolHint.Protocol = &pb.ProtocolHint_H2_{
-			H2: &pb.ProtocolHint_H2{},
+		weightedAddr.ProtocolHint = &pb.ProtocolHint{
+			Protocol: &pb.ProtocolHint_H2_{
+				H2: &pb.ProtocolHint_H2{},
+			},
 		}
 	}
 
@@ -521,10 +534,8 @@ func createWeightedAddr(address watcher.Address, opaquePorts map[uint32]struct{}
 	//
 	// TODO this should be relaxed to match a trust domain annotation so that
 	// multiple meshes can participate in identity if they share trust roots.
-	if identityTrustDomain != "" &&
-		controllerNSLabel == controllerNS &&
-		!isSkippedInboundPort {
-
+	if identityTrustDomain != "" {
+		sa, ns := pkgK8s.GetServiceAccountAndNS(address.Pod)
 		id := fmt.Sprintf("%s.%s.serviceaccount.identity.%s.%s", sa, ns, controllerNSLabel, identityTrustDomain)
 		weightedAddr.TlsIdentity = &pb.TlsIdentity{
 			Strategy: &pb.TlsIdentity_DnsLikeIdentity_{
